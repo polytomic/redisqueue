@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 )
 
 // ConsumerFunc is a type alias for the functions that will be used to handle
@@ -59,7 +59,7 @@ type ConsumerOptions struct {
 	RedisClient redis.UniversalClient
 	// RedisOptions allows you to configure the underlying Redis connection.
 	// More info here:
-	// https://pkg.go.dev/github.com/go-redis/redis/v8?tab=doc#Options.
+	// https://pkg.go.dev/github.com/redis/go-redis/v9?tab=doc#Options.
 	//
 	// This field is used if RedisClient field is nil.
 	RedisOptions *RedisOptions
