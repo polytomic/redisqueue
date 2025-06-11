@@ -491,4 +491,62 @@ func TestRun(t *testing.T) {
 		// run the consumer
 		c.Run()
 	})
+
+	t.Run("we can cancel the context", func(tt *testing.T) {
+		// create a consumer
+		c, err := NewConsumerWithOptions(&ConsumerOptions{
+			VisibilityTimeout: 60 * time.Second,
+			BlockingTimeout:   10 * time.Millisecond,
+			BufferSize:        100,
+			Concurrency:       10,
+		})
+		require.NoError(tt, err)
+
+		// create a producer
+		p, err := NewProducer()
+		require.NoError(tt, err)
+
+		// create consumer group
+		c.redis.XGroupDestroy(context.TODO(), tt.Name(), c.options.GroupName)
+		c.redis.XGroupCreateMkStream(context.TODO(), tt.Name(), c.options.GroupName, "$")
+
+		// enqueue a message
+		err = p.Enqueue(&Message{
+			Stream: tt.Name(),
+			Values: map[string]interface{}{"test": "value"},
+		})
+		require.NoError(tt, err)
+
+		// register a handler that will assert the message and then shut down
+		// the consumer
+		canceled := false
+		c.RegisterContext(tt.Name(), func(ctx context.Context, m *Message) error {
+			assert.Equal(tt, "value", m.Values["test"])
+			// if the timer fires, we failed to cancel ourselves in time
+			t := time.NewTimer(time.Millisecond * 10)
+			select {
+			case <-t.C:
+				tt.Fail()
+			case <-ctx.Done():
+				canceled = true
+			}
+			return nil
+		})
+
+		// watch for consumer errors
+		go func() {
+			err := <-c.Errors
+			require.NoError(tt, err)
+		}()
+
+		// pend a cancelation before running the consumer (which will block)
+		go func() {
+			time.Sleep(time.Millisecond * 5)
+			c.Shutdown()
+		}()
+
+		c.Run()
+
+		assert.True(tt, canceled)
+	})
 }
