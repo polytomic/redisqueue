@@ -2,12 +2,12 @@ package redisqueue
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 

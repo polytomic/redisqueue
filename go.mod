@@ -5,7 +5,6 @@ go 1.24
 require (
 	github.com/git-chglog/git-chglog v0.0.0-20190611050339-63a4e637021f
 	github.com/mattn/goveralls v0.0.2
-	github.com/pkg/errors v0.9.1
 	github.com/redis/go-redis/v9 v9.0.3
 	github.com/stretchr/testify v1.6.1
 )
