@@ -2,6 +2,8 @@ package redisqueue
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -18,9 +20,15 @@ type ProducerOptions struct {
 	// More info here: https://redis.io/commands/xadd#capped-streams.
 	StreamMaxLength int64
 	// ApproximateMaxLength determines whether to use the ~ with the MAXLEN
-	// option. This allows the stream trimming to done in a more efficient
-	// manner. More info here: https://redis.io/commands/xadd#capped-streams.
+	// or MINID option. This allows the stream trimming to be done in a more
+	// efficient manner. More info here: https://redis.io/commands/xadd#capped-streams.
 	ApproximateMaxLength bool
+	// StreamRetentionPeriod sets the MINID option when calling XADD. This
+	// trims messages older than the retention period from the stream, using
+	// the timestamp portion of Redis stream IDs. This is mutually exclusive
+	// with StreamMaxLength — if both are set, StreamRetentionPeriod takes
+	// precedence.
+	StreamRetentionPeriod time.Duration
 	// RedisClient supersedes the RedisOptions field, and allows you to inject
 	// an already-made Redis Client for use in the consumer. This may be either
 	// the standard client or a cluster client.
@@ -82,7 +90,12 @@ func (p *Producer) Enqueue(msg *Message) error {
 		Stream: msg.Stream,
 		Values: msg.Values,
 	}
-	args.MaxLen = p.options.StreamMaxLength
+	if p.options.StreamRetentionPeriod > 0 {
+		cutoff := time.Now().Add(-p.options.StreamRetentionPeriod)
+		args.MinID = fmt.Sprintf("%d", cutoff.UnixMilli())
+	} else if p.options.StreamMaxLength > 0 {
+		args.MaxLen = p.options.StreamMaxLength
+	}
 	if p.options.ApproximateMaxLength {
 		args.Approx = true
 	}

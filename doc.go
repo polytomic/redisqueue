@@ -13,8 +13,8 @@ The features of this package include:
       guarantees at least once delivery.
     - A "visibility timeout" so that if a message isn't processed in a designated
       time frame, it will be be processed by another consumer.
-    - A max length on the stream so that it doesn't store the messages indefinitely
-      and run out of memory.
+    - A max length or time-based retention period on the stream so that it doesn't
+      store the messages indefinitely and run out of memory.
     - Graceful handling of Unix signals (`SIGINT` and `SIGTERM`) to let in-flight
       messages complete.
     - A channel that will surface any errors so you can handle them centrally.
