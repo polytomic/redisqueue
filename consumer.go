@@ -307,6 +307,9 @@ func (c *Consumer) reclaim() {
 						Count:  int64(c.options.BufferSize - len(c.queue)),
 					}).Result()
 					if err != nil && err != redis.Nil {
+						if c.options.Context.Err() != nil {
+							break
+						}
 						c.Errors <- fmt.Errorf("error listing pending messages: %w", err)
 						break
 					}
@@ -327,6 +330,9 @@ func (c *Consumer) reclaim() {
 								Messages: []string{r.ID},
 							}).Result()
 							if err != nil && err != redis.Nil {
+								if c.options.Context.Err() != nil {
+									break
+								}
 								c.Errors <- fmt.Errorf("error claiming %d message(s): %w", len(msgs), err)
 								break
 							}
@@ -391,7 +397,7 @@ func (c *Consumer) poll() {
 				if err, ok := err.(net.Error); ok && err.Timeout() {
 					continue
 				}
-				if err == redis.Nil || err == context.Canceled {
+				if err == redis.Nil || err == context.Canceled || c.options.Context.Err() != nil {
 					continue
 				}
 				c.Errors <- fmt.Errorf("error reading redis stream: %w", err)
