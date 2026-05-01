@@ -15,7 +15,8 @@ import (
 )
 
 type commandHook struct {
-	process func(redis.Cmder)
+	process   func(redis.Cmder)
+	intercept func(context.Context, redis.Cmder, redis.ProcessHook) error
 }
 
 func (h commandHook) DialHook(next redis.DialHook) redis.DialHook {
@@ -29,12 +30,31 @@ func (h commandHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		if h.process != nil {
 			h.process(cmd)
 		}
+		if h.intercept != nil {
+			return h.intercept(ctx, cmd, next)
+		}
 		return next(ctx, cmd)
 	}
 }
 
 func (h commandHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return next
+}
+
+type redisError string
+
+func (e redisError) Error() string { return string(e) }
+
+func (redisError) RedisError() {}
+
+func hasStringArg(args []interface{}, want string) bool {
+	for _, arg := range args {
+		s, ok := arg.(string)
+		if ok && strings.EqualFold(s, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestNewConsumer(t *testing.T) {
@@ -131,6 +151,80 @@ func TestReclaimStreamUsesIdleFilter(t *testing.T) {
 		"+",
 		int64(c.options.BufferSize),
 	}, <-xpendingArgs)
+}
+
+func TestReclaimStreamFallsBackWhenIdleFilterUnsupported(t *testing.T) {
+	const staleID = "1-0"
+	const freshID = "2-0"
+
+	stream := t.Name()
+	xpendingArgs := make([][]interface{}, 0)
+	xclaimArgs := make([][]interface{}, 0)
+	xpendingWithoutIdleCalls := 0
+
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{intercept: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		switch strings.ToLower(cmd.Name()) {
+		case "xpending":
+			args := append([]interface{}{}, cmd.Args()...)
+			xpendingArgs = append(xpendingArgs, args)
+
+			if hasStringArg(args, "idle") {
+				return redisError("ERR syntax error")
+			}
+
+			xpendingWithoutIdleCalls++
+			if xpendingWithoutIdleCalls == 1 {
+				cmd.(*redis.XPendingExtCmd).SetVal([]redis.XPendingExt{
+					{ID: staleID, Consumer: "failed_consumer", Idle: 2 * time.Minute},
+					{ID: freshID, Consumer: "failed_consumer", Idle: 30 * time.Second},
+				})
+			}
+			return nil
+		case "xclaim":
+			args := append([]interface{}{}, cmd.Args()...)
+			xclaimArgs = append(xclaimArgs, args)
+			id := args[len(args)-1].(string)
+			cmd.(*redis.XMessageSliceCmd).SetVal([]redis.XMessage{{
+				ID:     id,
+				Values: map[string]interface{}{"test": "value"},
+			}})
+			return nil
+		default:
+			return next(ctx, cmd)
+		}
+	}})
+
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Name:              "test_consumer",
+		GroupName:         "test_group",
+		VisibilityTimeout: time.Minute,
+		BufferSize:        100,
+		RedisClient:       rc,
+	})
+	require.NoError(t, err)
+
+	c.reclaimStream(stream)
+
+	require.Len(t, xpendingArgs, 3)
+	assert.True(t, hasStringArg(xpendingArgs[0], "idle"))
+	assert.False(t, hasStringArg(xpendingArgs[1], "idle"))
+	assert.False(t, hasStringArg(xpendingArgs[2], "idle"))
+	require.Len(t, xclaimArgs, 1)
+	assert.Equal(t, staleID, xclaimArgs[0][len(xclaimArgs[0])-1])
+
+	select {
+	case msg := <-c.queue:
+		assert.Equal(t, staleID, msg.ID)
+	case <-time.After(time.Second):
+		t.Fatal("expected reclaimed stale message")
+	}
+
+	select {
+	case msg := <-c.queue:
+		t.Fatalf("expected fresh message to stay pending, got %q", msg.ID)
+	default:
+	}
 }
 
 func TestReclaimStreamSkipsWhenQueueFull(t *testing.T) {

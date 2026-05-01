@@ -95,6 +95,8 @@ type Consumer struct {
 	stopReclaim chan struct{}
 	stopPoll    chan struct{}
 	stopWorkers chan struct{}
+
+	xpendingIdleUnsupported bool
 }
 
 var defaultConsumerOptions = &ConsumerOptions{
@@ -329,14 +331,7 @@ func (c *Consumer) reclaimStream(stream string) {
 			return
 		}
 
-		res, err := c.redis.XPendingExt(c.options.Context, &redis.XPendingExtArgs{
-			Stream: stream,
-			Group:  c.options.GroupName,
-			Idle:   c.options.VisibilityTimeout,
-			Start:  start,
-			End:    end,
-			Count:  int64(capacity),
-		}).Result()
+		res, filterByIdle, err := c.xPendingExt(stream, start, end, int64(capacity))
 		if err != nil && err != redis.Nil {
 			if c.options.Context.Err() != nil {
 				break
@@ -350,6 +345,10 @@ func (c *Consumer) reclaimStream(stream string) {
 		}
 
 		for _, r := range res {
+			if filterByIdle && r.Idle < c.options.VisibilityTimeout {
+				continue
+			}
+
 			claimres, err := c.redis.XClaim(c.options.Context, &redis.XClaimArgs{
 				Stream:   stream,
 				Group:    c.options.GroupName,
@@ -391,6 +390,39 @@ func (c *Consumer) reclaimStream(stream string) {
 
 		start = newID
 	}
+}
+
+// xPendingExt lists pending messages, using XPENDING IDLE when Redis supports it.
+// The bool return value is true when Redis did not apply the idle filter, so the
+// caller must filter returned entries by XPendingExt.Idle locally.
+func (c *Consumer) xPendingExt(stream, start, end string, count int64) ([]redis.XPendingExt, bool, error) {
+	args := &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  c.options.GroupName,
+		Start:  start,
+		End:    end,
+		Count:  count,
+	}
+
+	if c.xpendingIdleUnsupported {
+		res, err := c.redis.XPendingExt(c.options.Context, args).Result()
+		return res, true, err
+	}
+
+	args.Idle = c.options.VisibilityTimeout
+	res, err := c.redis.XPendingExt(c.options.Context, args).Result()
+	if !isXPendingIdleUnsupported(err) {
+		return res, false, err
+	}
+
+	c.xpendingIdleUnsupported = true
+	args.Idle = 0
+	res, err = c.redis.XPendingExt(c.options.Context, args).Result()
+	return res, true, err
+}
+
+func isXPendingIdleUnsupported(err error) bool {
+	return redis.HasErrorPrefix(err, "syntax error") || redis.HasErrorPrefix(err, "unknown subcommand")
 }
 
 // poll constantly checks the streams using XREADGROUP to see if there are any
