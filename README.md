@@ -130,3 +130,23 @@ func process(msg *redisqueue.Message) error {
 	return nil
 }
 ```
+
+Retries for consumer group creation and acknowledgements are opt-in:
+
+```go
+c, err := redisqueue.NewConsumerWithOptions(&redisqueue.ConsumerOptions{
+	AckRetry: redisqueue.RetryOptions{
+		MaxAttempts:       5,
+		InitialBackoff:    100 * time.Millisecond,
+		MaxBackoff:        2 * time.Second,
+		PerAttemptTimeout: 3 * time.Second,
+	},
+	GroupCreateRetry: redisqueue.RetryOptions{
+		MaxAttempts:    10,
+		InitialBackoff: 250 * time.Millisecond,
+		MaxBackoff:     5 * time.Second,
+	},
+})
+```
+
+Retries apply to transient timeout errors, including `context deadline exceeded`.

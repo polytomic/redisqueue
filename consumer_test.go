@@ -116,6 +116,105 @@ func TestNewConsumerWithOptions(t *testing.T) {
 	})
 }
 
+func TestRunRetriesGroupCreateTimeouts(t *testing.T) {
+	var c *Consumer
+	attempts := 0
+
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{intercept: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if strings.EqualFold(cmd.Name(), "xgroup") && hasStringArg(cmd.Args(), "create") {
+			attempts++
+			if attempts == 1 {
+				return context.DeadlineExceeded
+			}
+			c.Shutdown()
+			return nil
+		}
+		return next(ctx, cmd)
+	}})
+
+	var err error
+	c, err = NewConsumerWithOptions(&ConsumerOptions{
+		VisibilityTimeout: 0,
+		BlockingTimeout:   time.Millisecond,
+		BufferSize:        1,
+		Concurrency:       1,
+		RedisClient:       rc,
+		GroupCreateRetry: RetryOptions{
+			MaxAttempts: 2,
+		},
+	})
+	require.NoError(t, err)
+	c.Errors = make(chan error, 1)
+	c.Register(t.Name(), func(msg *Message) error { return nil })
+
+	c.Run()
+
+	assert.Equal(t, 2, attempts)
+	select {
+	case err := <-c.Errors:
+		t.Fatalf("unexpected error: %v", err)
+	default:
+	}
+}
+
+func TestWorkerRetriesAckTimeouts(t *testing.T) {
+	var c *Consumer
+	attempts := 0
+	processed := false
+
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{intercept: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if strings.EqualFold(cmd.Name(), "xack") {
+			attempts++
+			if attempts == 1 {
+				return context.DeadlineExceeded
+			}
+			c.stopWorkers <- struct{}{}
+			return nil
+		}
+		return next(ctx, cmd)
+	}})
+
+	var err error
+	c, err = NewConsumerWithOptions(&ConsumerOptions{
+		BufferSize:  1,
+		Concurrency: 1,
+		RedisClient: rc,
+		AckRetry: RetryOptions{
+			MaxAttempts: 2,
+		},
+	})
+	require.NoError(t, err)
+	c.Errors = make(chan error, 1)
+	c.Register(t.Name(), func(msg *Message) error {
+		processed = true
+		return nil
+	})
+
+	c.wg.Add(1)
+	done := make(chan struct{})
+	go func() {
+		c.work()
+		close(done)
+	}()
+	c.queue <- &Message{ID: "1-0", Stream: t.Name()}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop")
+	}
+
+	assert.True(t, processed)
+	assert.Equal(t, 2, attempts)
+	select {
+	case err := <-c.Errors:
+		t.Fatalf("unexpected error: %v", err)
+	default:
+	}
+}
+
 func TestReclaimStreamUsesIdleFilter(t *testing.T) {
 	xpendingArgs := make(chan []interface{}, 1)
 	rc := newRedisClient(nil)

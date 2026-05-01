@@ -19,6 +19,20 @@ type ConsumerFunc func(*Message) error
 
 type ConsumerFuncContext func(context.Context, *Message) error
 
+// RetryOptions configures retry behavior for transient Redis errors.
+// MaxAttempts includes the initial attempt. If MaxAttempts is less than 2,
+// operations are attempted once with no retry.
+type RetryOptions struct {
+	// MaxAttempts is the maximum number of attempts, including the initial one.
+	MaxAttempts int
+	// InitialBackoff is the delay before the first retry. If zero, retries are immediate.
+	InitialBackoff time.Duration
+	// MaxBackoff caps exponential backoff. If zero, InitialBackoff is used without a cap.
+	MaxBackoff time.Duration
+	// PerAttemptTimeout bounds each Redis attempt. If zero, the caller's context is used directly.
+	PerAttemptTimeout time.Duration
+}
+
 type registeredConsumer struct {
 	fn  ConsumerFunc
 	fnc ConsumerFuncContext
@@ -71,6 +85,11 @@ type ConsumerOptions struct {
 
 	// Context is the context for the consumer and processing functions.
 	Context context.Context
+	// AckRetry configures retries for XACK after successful processing and
+	// after deleted pending messages are discovered during reclaim.
+	AckRetry RetryOptions
+	// GroupCreateRetry configures retries for creating consumer groups during Run.
+	GroupCreateRetry RetryOptions
 
 	contextCancel context.CancelFunc
 }
@@ -235,7 +254,9 @@ func (c *Consumer) Run() {
 
 	for stream, consumer := range c.consumers {
 		c.streams = append(c.streams, stream)
-		err := c.redis.XGroupCreateMkStream(c.options.Context, stream, c.options.GroupName, consumer.id).Err()
+		err := c.withRetry(c.options.Context, c.options.GroupCreateRetry, func(ctx context.Context) error {
+			return c.redis.XGroupCreateMkStream(ctx, stream, c.options.GroupName, consumer.id).Err()
+		})
 		// ignoring the BUSYGROUP error makes this a noop
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 			c.Errors <- fmt.Errorf("error creating consumer group: %w", err)
@@ -373,7 +394,7 @@ func (c *Consumer) reclaimStream(stream string) {
 			// exists, the only way we can get it out of the
 			// pending state is to acknowledge it.
 			if err == redis.Nil {
-				err = c.redis.XAck(context.Background(), stream, c.options.GroupName, r.ID).Err()
+				err = c.ackMessage(context.Background(), stream, r.ID)
 				if err != nil {
 					c.Errors <- fmt.Errorf("error acknowledging after failed claim for %q stream, %q group, and %q message: %w", stream, c.options.GroupName, r.ID, err)
 					continue
@@ -485,6 +506,70 @@ func (c *Consumer) enqueue(stream string, msgs []redis.XMessage) {
 // channel, it calls the corrensponding ConsumerFunc depending on the stream it
 // came from. If no error is returned from the ConsumerFunc, the message is
 // acknowledged in Redis.
+func (c *Consumer) ackMessage(ctx context.Context, stream string, id string) error {
+	return c.withRetry(ctx, c.options.AckRetry, func(ctx context.Context) error {
+		return c.redis.XAck(ctx, stream, c.options.GroupName, id).Err()
+	})
+}
+
+func (c *Consumer) withRetry(ctx context.Context, options RetryOptions, fn func(context.Context) error) error {
+	maxAttempts := options.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptCtx := ctx
+		cancel := func() {}
+		if options.PerAttemptTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, options.PerAttemptTimeout)
+		}
+
+		err = fn(attemptCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if attempt == maxAttempts || !isRetryableRedisError(err) || ctx.Err() != nil {
+			return err
+		}
+		if delay := retryDelay(options, attempt); delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return err
+			}
+		}
+	}
+
+	return err
+}
+
+func retryDelay(options RetryOptions, attempt int) time.Duration {
+	delay := options.InitialBackoff
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if options.MaxBackoff > 0 && delay >= options.MaxBackoff {
+			return options.MaxBackoff
+		}
+	}
+	if options.MaxBackoff > 0 && delay > options.MaxBackoff {
+		return options.MaxBackoff
+	}
+	return delay
+}
+
+func isRetryableRedisError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 func (c *Consumer) work() {
 	defer c.wg.Done()
 
@@ -496,7 +581,7 @@ func (c *Consumer) work() {
 				c.Errors <- fmt.Errorf("error calling ConsumerFunc for %q stream and %q message: %w", msg.Stream, msg.ID, err)
 				continue
 			}
-			err = c.redis.XAck(context.Background(), msg.Stream, c.options.GroupName, msg.ID).Err()
+			err = c.ackMessage(context.Background(), msg.Stream, msg.ID)
 			if err != nil {
 				c.Errors <- fmt.Errorf("error acknowledging after success for %q stream and %q message: %w", msg.Stream, msg.ID, err)
 				continue
