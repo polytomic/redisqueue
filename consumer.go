@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -94,6 +95,8 @@ type Consumer struct {
 	stopReclaim chan struct{}
 	stopPoll    chan struct{}
 	stopWorkers chan struct{}
+
+	xpendingIdleUnsupported bool
 }
 
 var defaultConsumerOptions = &ConsumerOptions{
@@ -275,17 +278,18 @@ func (c *Consumer) Shutdown() {
 }
 
 // reclaim runs in a separate goroutine and checks the list of pending messages
-// in every stream. For every message, if it's been idle for longer than the
-// VisibilityTimeout, it will attempt to claim that message for this consumer.
-// If VisibilityTimeout is 0, this function returns early and no messages are
+// in every stream that have been idle for longer than VisibilityTimeout. It
+// attempts to claim each stale pending message for this consumer. If
+// VisibilityTimeout is 0, this function returns early and no messages are
 // reclaimed. It checks the list of pending messages according to
-// ReclaimInterval.
+// ReclaimInterval with jitter to avoid synchronized reclaim bursts.
 func (c *Consumer) reclaim() {
 	if c.options.VisibilityTimeout == 0 {
 		return
 	}
 
-	ticker := time.NewTicker(c.options.ReclaimInterval)
+	timer := time.NewTimer(c.reclaimDelay())
+	defer timer.Stop()
 
 	for {
 		select {
@@ -293,80 +297,132 @@ func (c *Consumer) reclaim() {
 			// once the reclaim process has stopped, stop the polling process
 			c.stopPoll <- struct{}{}
 			return
-		case <-ticker.C:
-			for stream := range c.consumers {
-				start := "-"
-				end := "+"
-
-				for {
-					res, err := c.redis.XPendingExt(c.options.Context, &redis.XPendingExtArgs{
-						Stream: stream,
-						Group:  c.options.GroupName,
-						Start:  start,
-						End:    end,
-						Count:  int64(c.options.BufferSize - len(c.queue)),
-					}).Result()
-					if err != nil && err != redis.Nil {
-						if c.options.Context.Err() != nil {
-							break
-						}
-						c.Errors <- fmt.Errorf("error listing pending messages: %w", err)
-						break
-					}
-
-					if len(res) == 0 {
-						break
-					}
-
-					msgs := make([]string, 0)
-
-					for _, r := range res {
-						if r.Idle >= c.options.VisibilityTimeout {
-							claimres, err := c.redis.XClaim(c.options.Context, &redis.XClaimArgs{
-								Stream:   stream,
-								Group:    c.options.GroupName,
-								Consumer: c.options.Name,
-								MinIdle:  c.options.VisibilityTimeout,
-								Messages: []string{r.ID},
-							}).Result()
-							if err != nil && err != redis.Nil {
-								if c.options.Context.Err() != nil {
-									break
-								}
-								c.Errors <- fmt.Errorf("error claiming %d message(s): %w", len(msgs), err)
-								break
-							}
-							// If the Redis nil error is returned, it means that
-							// the message no longer exists in the stream.
-							// However, it is still in a pending state. This
-							// could happen if a message was claimed by a
-							// consumer, that consumer died, and the message
-							// gets deleted (either through a XDEL call or
-							// through MAXLEN). Since the message no longer
-							// exists, the only way we can get it out of the
-							// pending state is to acknowledge it.
-							if err == redis.Nil {
-								err = c.redis.XAck(context.Background(), stream, c.options.GroupName, r.ID).Err()
-								if err != nil {
-									c.Errors <- fmt.Errorf("error acknowledging after failed claim for %q stream and %q message: %w", stream, r.ID, err)
-									continue
-								}
-							}
-							c.enqueue(stream, claimres)
-						}
-					}
-
-					newID, err := incrementMessageID(res[len(res)-1].ID)
-					if err != nil {
-						c.Errors <- err
-						break
-					}
-
-					start = newID
-				}
-			}
+		case <-timer.C:
+			c.reclaimPendingMessages()
+			timer.Reset(c.reclaimDelay())
 		}
 	}
+}
+
+func (c *Consumer) reclaimDelay() time.Duration {
+	return c.options.ReclaimInterval + jitter(c.options.ReclaimInterval)
+}
+
+func jitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(max)))
+}
+
+func (c *Consumer) reclaimPendingMessages() {
+	for stream := range c.consumers {
+		c.reclaimStream(stream)
+	}
+}
+
+func (c *Consumer) reclaimStream(stream string) {
+	start := "-"
+	end := "+"
+
+	for {
+		capacity := c.options.BufferSize - len(c.queue)
+		if capacity <= 0 {
+			return
+		}
+
+		res, filterByIdle, err := c.xPendingExt(stream, start, end, int64(capacity))
+		if err != nil && err != redis.Nil {
+			if c.options.Context.Err() != nil {
+				break
+			}
+			c.Errors <- fmt.Errorf("error listing pending messages for %q stream, %q group, and %q consumer: %w", stream, c.options.GroupName, c.options.Name, err)
+			break
+		}
+
+		if len(res) == 0 {
+			break
+		}
+
+		for _, r := range res {
+			if filterByIdle && r.Idle < c.options.VisibilityTimeout {
+				continue
+			}
+
+			claimres, err := c.redis.XClaim(c.options.Context, &redis.XClaimArgs{
+				Stream:   stream,
+				Group:    c.options.GroupName,
+				Consumer: c.options.Name,
+				MinIdle:  c.options.VisibilityTimeout,
+				Messages: []string{r.ID},
+			}).Result()
+			if err != nil && err != redis.Nil {
+				if c.options.Context.Err() != nil {
+					break
+				}
+				c.Errors <- fmt.Errorf("error claiming pending message for %q stream, %q group, %q consumer, and %q message: %w", stream, c.options.GroupName, c.options.Name, r.ID, err)
+				break
+			}
+			// If the Redis nil error is returned, it means that
+			// the message no longer exists in the stream.
+			// However, it is still in a pending state. This
+			// could happen if a message was claimed by a
+			// consumer, that consumer died, and the message
+			// gets deleted (either through a XDEL call or
+			// through MAXLEN). Since the message no longer
+			// exists, the only way we can get it out of the
+			// pending state is to acknowledge it.
+			if err == redis.Nil {
+				err = c.redis.XAck(context.Background(), stream, c.options.GroupName, r.ID).Err()
+				if err != nil {
+					c.Errors <- fmt.Errorf("error acknowledging after failed claim for %q stream, %q group, and %q message: %w", stream, c.options.GroupName, r.ID, err)
+					continue
+				}
+			}
+			c.enqueue(stream, claimres)
+		}
+
+		newID, err := incrementMessageID(res[len(res)-1].ID)
+		if err != nil {
+			c.Errors <- err
+			break
+		}
+
+		start = newID
+	}
+}
+
+// xPendingExt lists pending messages, using XPENDING IDLE when Redis supports it.
+// The bool return value is true when Redis did not apply the idle filter, so the
+// caller must filter returned entries by XPendingExt.Idle locally.
+func (c *Consumer) xPendingExt(stream, start, end string, count int64) ([]redis.XPendingExt, bool, error) {
+	args := &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  c.options.GroupName,
+		Start:  start,
+		End:    end,
+		Count:  count,
+	}
+
+	if c.xpendingIdleUnsupported {
+		res, err := c.redis.XPendingExt(c.options.Context, args).Result()
+		return res, true, err
+	}
+
+	args.Idle = c.options.VisibilityTimeout
+	res, err := c.redis.XPendingExt(c.options.Context, args).Result()
+	if !isXPendingIdleUnsupported(err) {
+		return res, false, err
+	}
+
+	c.xpendingIdleUnsupported = true
+	args.Idle = 0
+	res, err = c.redis.XPendingExt(c.options.Context, args).Result()
+	return res, true, err
+}
+
+func isXPendingIdleUnsupported(err error) bool {
+	return redis.HasErrorPrefix(err, "syntax error") || redis.HasErrorPrefix(err, "unknown subcommand")
 }
 
 // poll constantly checks the streams using XREADGROUP to see if there are any
