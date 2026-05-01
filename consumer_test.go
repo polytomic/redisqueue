@@ -3,7 +3,9 @@ package redisqueue
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,29 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type commandHook struct {
+	process func(redis.Cmder)
+}
+
+func (h commandHook) DialHook(next redis.DialHook) redis.DialHook {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return next(ctx, network, addr)
+	}
+}
+
+func (h commandHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.process != nil {
+			h.process(cmd)
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h commandHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
 
 func TestNewConsumer(t *testing.T) {
 	t.Run("creates a new consumer", func(tt *testing.T) {
@@ -69,6 +94,98 @@ func TestNewConsumerWithOptions(t *testing.T) {
 
 		assert.Contains(tt, err.Error(), "dial tcp")
 	})
+}
+
+func TestReclaimStreamUsesIdleFilter(t *testing.T) {
+	xpendingArgs := make(chan []interface{}, 1)
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{process: func(cmd redis.Cmder) {
+		if strings.EqualFold(cmd.Name(), "xpending") {
+			xpendingArgs <- append([]interface{}{}, cmd.Args()...)
+		}
+	}})
+
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Name:              "test_consumer",
+		GroupName:         "test_group",
+		VisibilityTimeout: time.Minute,
+		BufferSize:        100,
+		RedisClient:       rc,
+	})
+	require.NoError(t, err)
+
+	stream := t.Name()
+	c.redis.XGroupDestroy(context.TODO(), stream, c.options.GroupName)
+	require.NoError(t, c.redis.XGroupCreateMkStream(context.TODO(), stream, c.options.GroupName, "$").Err())
+	c.Register(stream, func(msg *Message) error { return nil })
+
+	c.reclaimStream(stream)
+
+	require.Equal(t, []interface{}{
+		"xpending",
+		stream,
+		c.options.GroupName,
+		"idle",
+		int64(c.options.VisibilityTimeout / time.Millisecond),
+		"-",
+		"+",
+		int64(c.options.BufferSize),
+	}, <-xpendingArgs)
+}
+
+func TestReclaimStreamSkipsWhenQueueFull(t *testing.T) {
+	xpendingArgs := make(chan []interface{}, 1)
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{process: func(cmd redis.Cmder) {
+		if strings.EqualFold(cmd.Name(), "xpending") {
+			xpendingArgs <- append([]interface{}{}, cmd.Args()...)
+		}
+	}})
+
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Name:              "test_consumer",
+		GroupName:         "test_group",
+		VisibilityTimeout: time.Minute,
+		BufferSize:        1,
+		RedisClient:       rc,
+	})
+	require.NoError(t, err)
+
+	c.Register(t.Name(), func(msg *Message) error { return nil })
+	c.queue <- &Message{ID: "queued"}
+
+	c.reclaimStream(t.Name())
+
+	select {
+	case args := <-xpendingArgs:
+		t.Fatalf("expected no XPENDING calls with a full queue, got %v", args)
+	default:
+	}
+}
+
+func TestReclaimStreamErrorsIncludeContext(t *testing.T) {
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Name:              "test_consumer",
+		GroupName:         "test_group",
+		VisibilityTimeout: time.Minute,
+		BufferSize:        100,
+	})
+	require.NoError(t, err)
+
+	stream := t.Name()
+	c.redis.XGroupDestroy(context.TODO(), stream, c.options.GroupName)
+	c.Register(stream, func(msg *Message) error { return nil })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- <-c.Errors }()
+
+	c.reclaimStream(stream)
+
+	err = <-errCh
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), stream)
+	assert.Contains(t, err.Error(), c.options.GroupName)
+	assert.Contains(t, err.Error(), c.options.Name)
 }
 
 func TestRegister(t *testing.T) {
