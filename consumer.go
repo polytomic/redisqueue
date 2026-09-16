@@ -114,6 +114,8 @@ type Consumer struct {
 	stopReclaim chan struct{}
 	stopPoll    chan struct{}
 	stopWorkers chan struct{}
+	// dequeued wakes poll when a worker frees a slot in queue.
+	dequeued chan struct{}
 
 	xpendingIdleUnsupported bool
 }
@@ -185,6 +187,7 @@ func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
 		stopReclaim: make(chan struct{}, 1),
 		stopPoll:    make(chan struct{}, 1),
 		stopWorkers: make(chan struct{}, options.Concurrency),
+		dequeued:    make(chan struct{}, 1),
 	}, nil
 }
 
@@ -463,11 +466,24 @@ func (c *Consumer) poll() {
 		case <-c.options.Context.Done():
 			return
 		default:
+			capacity := c.options.BufferSize - len(c.queue)
+			if c.options.BufferSize <= 0 {
+				// An unbuffered queue hands each message straight to a worker.
+				capacity = 1
+			} else if capacity <= 0 {
+				// go-redis omits a zero COUNT, and XREADGROUP without COUNT
+				// returns every new message on every stream.
+				select {
+				case <-c.dequeued:
+				case <-c.options.Context.Done():
+				}
+				continue
+			}
 			res, err := c.redis.XReadGroup(c.options.Context, &redis.XReadGroupArgs{
 				Group:    c.options.GroupName,
 				Consumer: c.options.Name,
 				Streams:  c.streams,
-				Count:    int64(c.options.BufferSize - len(c.queue)),
+				Count:    int64(capacity),
 				Block:    c.options.BlockingTimeout,
 			}).Result()
 			if err != nil {
@@ -576,6 +592,10 @@ func (c *Consumer) work() {
 	for {
 		select {
 		case msg := <-c.queue:
+			select {
+			case c.dequeued <- struct{}{}:
+			default:
+			}
 			err := c.process(msg)
 			if err != nil {
 				c.Errors <- fmt.Errorf("error calling ConsumerFunc for %q stream and %q message: %w", msg.Stream, msg.ID, err)
