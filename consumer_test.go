@@ -435,6 +435,75 @@ func TestPollWaitsForQueueCapacity(t *testing.T) {
 	assert.EqualValues(t, 1, pending.Count)
 }
 
+func TestPollReadsOneAtATimeForUnbufferedQueue(t *testing.T) {
+	readCounts := make(chan interface{}, 10)
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{process: func(cmd redis.Cmder) {
+		if !strings.EqualFold(cmd.Name(), "xreadgroup") {
+			return
+		}
+		args := cmd.Args()
+		var count interface{}
+		for i := 0; i < len(args)-1; i++ {
+			if s, ok := args[i].(string); ok && strings.EqualFold(s, "count") {
+				count = args[i+1]
+			}
+		}
+		readCounts <- count
+	}})
+
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Name:            "test_consumer",
+		GroupName:       "test_group",
+		BlockingTimeout: 10 * time.Millisecond,
+		Concurrency:     1,
+		RedisClient:     rc,
+	})
+	require.NoError(t, err)
+	c.Errors = make(chan error, 10)
+
+	stream := t.Name()
+	rc.Del(context.TODO(), stream)
+	require.NoError(t, rc.XGroupCreateMkStream(context.TODO(), stream, c.options.GroupName, "$").Err())
+	for i := 0; i < 3; i++ {
+		require.NoError(t, rc.XAdd(context.TODO(), &redis.XAddArgs{
+			Stream: stream,
+			Values: map[string]interface{}{"i": i},
+		}).Err())
+	}
+	c.Register(stream, func(msg *Message) error { return nil })
+	c.streams = []string{stream, ">"}
+
+	done := make(chan struct{})
+	go func() {
+		c.poll()
+		close(done)
+	}()
+	defer func() {
+		c.options.contextCancel()
+		for {
+			select {
+			case <-done:
+				return
+			case <-c.queue:
+			}
+		}
+	}()
+
+	select {
+	case msg := <-c.queue:
+		assert.Equal(t, stream, msg.Stream)
+	case <-time.After(time.Second):
+		t.Fatal("expected a message handed off through the unbuffered queue")
+	}
+	select {
+	case count := <-readCounts:
+		assert.EqualValues(t, 1, count)
+	case <-time.After(time.Second):
+		t.Fatal("expected an XREADGROUP")
+	}
+}
+
 func TestReclaimStreamErrorsIncludeContext(t *testing.T) {
 	c, err := NewConsumerWithOptions(&ConsumerOptions{
 		Name:              "test_consumer",

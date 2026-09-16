@@ -467,7 +467,10 @@ func (c *Consumer) poll() {
 			return
 		default:
 			capacity := c.options.BufferSize - len(c.queue)
-			if capacity <= 0 {
+			if c.options.BufferSize <= 0 {
+				// An unbuffered queue hands each message straight to a worker.
+				capacity = 1
+			} else if capacity <= 0 {
 				// go-redis omits a zero COUNT, and XREADGROUP without COUNT
 				// returns every new message on every stream.
 				select {
