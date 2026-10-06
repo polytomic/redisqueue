@@ -7,7 +7,9 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -60,12 +62,20 @@ type ConsumerOptions struct {
 	// seconds, or even longer, depending on how long your application can wait
 	// to shutdown.
 	BlockingTimeout time.Duration
-	// ReclaimInterval is the amount of time in between calls to XPENDING to
-	// attempt to reclaim jobs that have been idle for more than the visibility
-	// timeout. A smaller duration will result in more frequent checks. This
+	// ReclaimInterval is the amount of time in between passes over the pending
+	// messages of every stream, claiming the ones that have been idle for more
+	// than the visibility timeout. Each pass scans up to the highest pending
+	// ID captured for each stream at its start. A smaller duration will result
+	// in more frequent checks. This
 	// will allow messages to be reaped faster, but it will put more load on
 	// Redis.
 	ReclaimInterval time.Duration
+	// ReclaimShare gives reclaimed messages one of every ReclaimShare
+	// messages workers take while both new and reclaimed messages are ready,
+	// so new messages keep priority without starving a backlog of stale
+	// pending messages. A worker that finds no new message ready takes a
+	// reclaimed one right away. If 0, it defaults to 4.
+	ReclaimShare int
 	// BufferSize determines the size of the channel uses to coordinate the
 	// processing of the messages. This determines the maximum number of
 	// in-flight messages.
@@ -109,13 +119,19 @@ type Consumer struct {
 	consumers map[string]registeredConsumer
 	streams   []string
 	queue     chan *Message
-	wg        *sync.WaitGroup
+	// reclaimQueue hands stale pending candidates to an available worker,
+	// which claims them with XCLAIM.
+	reclaimQueue chan *Message
+	wg           *sync.WaitGroup
 
 	stopReclaim chan struct{}
 	stopPoll    chan struct{}
 	stopWorkers chan struct{}
 	// dequeued wakes poll when a worker frees a slot in queue.
 	dequeued chan struct{}
+	// takes counts the times workers have gone looking for a message. Every
+	// ReclaimShare-th take prefers reclaimQueue.
+	takes atomic.Int64
 
 	xpendingIdleUnsupported bool
 }
@@ -140,7 +156,8 @@ func NewConsumer() (*Consumer, error) {
 // NewConsumerWithOptions creates a Consumer with custom ConsumerOptions. If
 // Name is left empty, it defaults to the hostname; if GroupName is left empty,
 // it defaults to "redisqueue"; if BlockingTimeout is 0, it defaults to 5
-// seconds; if ReclaimInterval is 0, it defaults to 1 second.
+// seconds; if ReclaimInterval is 0, it defaults to 1 second; if ReclaimShare is
+// 0, it defaults to 4.
 func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
 	hostname, _ := os.Hostname()
 
@@ -155,6 +172,9 @@ func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
 	}
 	if options.ReclaimInterval == 0 {
 		options.ReclaimInterval = 1 * time.Second
+	}
+	if options.ReclaimShare <= 0 {
+		options.ReclaimShare = 4
 	}
 
 	if options.Context == nil {
@@ -177,12 +197,13 @@ func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
 	return &Consumer{
 		Errors: make(chan error),
 
-		options:   options,
-		redis:     r,
-		consumers: make(map[string]registeredConsumer),
-		streams:   make([]string, 0),
-		queue:     make(chan *Message, options.BufferSize),
-		wg:        &sync.WaitGroup{},
+		options:      options,
+		redis:        r,
+		consumers:    make(map[string]registeredConsumer),
+		streams:      make([]string, 0),
+		queue:        make(chan *Message, options.BufferSize),
+		reclaimQueue: make(chan *Message),
+		wg:           &sync.WaitGroup{},
 
 		stopReclaim: make(chan struct{}, 1),
 		stopPoll:    make(chan struct{}, 1),
@@ -303,10 +324,11 @@ func (c *Consumer) Shutdown() {
 
 // reclaim runs in a separate goroutine and checks the list of pending messages
 // in every stream that have been idle for longer than VisibilityTimeout. It
-// attempts to claim each stale pending message for this consumer. If
-// VisibilityTimeout is 0, this function returns early and no messages are
-// reclaimed. It checks the list of pending messages according to
-// ReclaimInterval with jitter to avoid synchronized reclaim bursts.
+// hands each stale pending message to a worker, which claims it for this
+// consumer as ReclaimShare allows. If VisibilityTimeout is 0, this function
+// returns early and no messages are reclaimed. It starts a pass over the
+// pending messages according to ReclaimInterval with jitter to avoid
+// synchronized reclaim bursts.
 func (c *Consumer) reclaim() {
 	if c.options.VisibilityTimeout == 0 {
 		return
@@ -340,80 +362,125 @@ func jitter(max time.Duration) time.Duration {
 }
 
 func (c *Consumer) reclaimPendingMessages() {
+	streams := make([]string, 0, len(c.consumers))
 	for stream := range c.consumers {
-		c.reclaimStream(stream)
+		streams = append(streams, stream)
+	}
+	sort.Strings(streams)
+	starts := make(map[string]string, len(streams))
+	ends := make(map[string]string, len(streams))
+	// Snapshot every stream before handing off work. New pending IDs belong
+	// to the next pass, so a growing tail cannot prevent older failures from
+	// being revisited at the next interval.
+	remaining := streams[:0]
+	for _, stream := range streams {
+		pending, err := c.redis.XPending(c.options.Context, stream, c.options.GroupName).Result()
+		if err != nil && err != redis.Nil {
+			if c.options.Context.Err() != nil {
+				return
+			}
+			c.Errors <- fmt.Errorf("error listing pending messages for %q stream, %q group, and %q consumer: %w", stream, c.options.GroupName, c.options.Name, err)
+			continue
+		}
+		if pending == nil || pending.Count == 0 {
+			continue
+		}
+		starts[stream] = "-"
+		ends[stream] = pending.Higher
+		remaining = append(remaining, stream)
+	}
+	streams = remaining
+
+	// Take one batch from each stream in turn so a backlog on one stream
+	// cannot hold up the others.
+	for len(streams) > 0 {
+		remaining := streams[:0]
+		for _, stream := range streams {
+			if c.options.Context.Err() != nil {
+				return
+			}
+			next, more := c.reclaimBatch(stream, starts[stream], ends[stream])
+			if more {
+				starts[stream] = next
+				remaining = append(remaining, stream)
+			}
+		}
+		streams = remaining
 	}
 }
 
-func (c *Consumer) reclaimStream(stream string) {
-	start := "-"
-	end := "+"
+// reclaimBatch scans idle pending messages on stream from start through end
+// and hands each one to a worker to claim. It returns the ID to resume from and
+// whether the stream may have more pending messages.
+func (c *Consumer) reclaimBatch(stream, start, end string) (string, bool) {
+	count := int64(max(c.options.BufferSize, c.options.Concurrency, 1))
 
-	for {
-		capacity := c.options.BufferSize - len(c.queue)
-		if capacity <= 0 {
-			return
-		}
-
-		res, filterByIdle, err := c.xPendingExt(stream, start, end, int64(capacity))
-		if err != nil && err != redis.Nil {
-			if c.options.Context.Err() != nil {
-				break
-			}
+	res, filterByIdle, err := c.xPendingExt(stream, start, end, count)
+	if err != nil && err != redis.Nil {
+		if c.options.Context.Err() == nil {
 			c.Errors <- fmt.Errorf("error listing pending messages for %q stream, %q group, and %q consumer: %w", stream, c.options.GroupName, c.options.Name, err)
-			break
 		}
-
-		if len(res) == 0 {
-			break
-		}
-
-		for _, r := range res {
-			if filterByIdle && r.Idle < c.options.VisibilityTimeout {
-				continue
-			}
-
-			claimres, err := c.redis.XClaim(c.options.Context, &redis.XClaimArgs{
-				Stream:   stream,
-				Group:    c.options.GroupName,
-				Consumer: c.options.Name,
-				MinIdle:  c.options.VisibilityTimeout,
-				Messages: []string{r.ID},
-			}).Result()
-			if err != nil && err != redis.Nil {
-				if c.options.Context.Err() != nil {
-					break
-				}
-				c.Errors <- fmt.Errorf("error claiming pending message for %q stream, %q group, %q consumer, and %q message: %w", stream, c.options.GroupName, c.options.Name, r.ID, err)
-				break
-			}
-			// If the Redis nil error is returned, it means that
-			// the message no longer exists in the stream.
-			// However, it is still in a pending state. This
-			// could happen if a message was claimed by a
-			// consumer, that consumer died, and the message
-			// gets deleted (either through a XDEL call or
-			// through MAXLEN). Since the message no longer
-			// exists, the only way we can get it out of the
-			// pending state is to acknowledge it.
-			if err == redis.Nil {
-				err = c.ackMessage(context.Background(), stream, r.ID)
-				if err != nil {
-					c.Errors <- fmt.Errorf("error acknowledging after failed claim for %q stream, %q group, and %q message: %w", stream, c.options.GroupName, r.ID, err)
-					continue
-				}
-			}
-			c.enqueue(stream, claimres)
-		}
-
-		newID, err := incrementMessageID(res[len(res)-1].ID)
-		if err != nil {
-			c.Errors <- err
-			break
-		}
-
-		start = newID
+		return "", false
 	}
+	if len(res) == 0 {
+		return "", false
+	}
+
+	for _, r := range res {
+		if filterByIdle && r.Idle < c.options.VisibilityTimeout {
+			continue
+		}
+		// The worker that takes the candidate claims it, so a claimed message
+		// does not wait long enough for another consumer to claim it again.
+		select {
+		case c.reclaimQueue <- &Message{ID: r.ID, Stream: stream}:
+		case <-c.options.Context.Done():
+			return "", false
+		}
+	}
+
+	newID, err := incrementMessageID(res[len(res)-1].ID)
+	if err != nil {
+		c.Errors <- err
+		return "", false
+	}
+	return newID, true
+}
+
+// claimPendingMessage rechecks idle time at ownership transfer. Workers call
+// it only after accepting a candidate, so waiting for a worker does not
+// consume the reclaimed message's visibility timeout.
+func (c *Consumer) claimPendingMessage(stream, id string) ([]redis.XMessage, error) {
+	claimres, err := c.redis.XClaim(c.options.Context, &redis.XClaimArgs{
+		Stream:   stream,
+		Group:    c.options.GroupName,
+		Consumer: c.options.Name,
+		MinIdle:  c.options.VisibilityTimeout,
+		Messages: []string{id},
+	}).Result()
+	if err != nil && err != redis.Nil {
+		if c.options.Context.Err() == nil {
+			c.Errors <- fmt.Errorf("error claiming pending message for %q stream, %q group, %q consumer, and %q message: %w", stream, c.options.GroupName, c.options.Name, id, err)
+		}
+		return nil, err
+	}
+	// If the Redis nil error is returned, it means that
+	// the message no longer exists in the stream.
+	// However, it is still in a pending state. This
+	// could happen if a message was claimed by a
+	// consumer, that consumer died, and the message
+	// gets deleted (either through a XDEL call or
+	// through MAXLEN). Since the message no longer
+	// exists, the only way we can get it out of the
+	// pending state is to acknowledge it.
+	if err == redis.Nil {
+		err = c.ackMessage(context.Background(), stream, id)
+		if err != nil {
+			c.Errors <- fmt.Errorf("error acknowledging after failed claim for %q stream, %q group, and %q message: %w", stream, c.options.GroupName, id, err)
+		}
+		return nil, nil
+	}
+	return claimres, nil
 }
 
 // xPendingExt lists pending messages, using XPENDING IDLE when Redis supports it.
@@ -590,28 +657,73 @@ func (c *Consumer) work() {
 	defer c.wg.Done()
 
 	for {
-		select {
-		case msg := <-c.queue:
-			select {
-			case c.dequeued <- struct{}{}:
-			default:
-			}
-			err := c.process(msg)
-			if err != nil {
-				c.Errors <- fmt.Errorf("error calling ConsumerFunc for %q stream and %q message: %w", msg.Stream, msg.ID, err)
-				continue
-			}
-			err = c.ackMessage(context.Background(), msg.Stream, msg.ID)
-			if err != nil {
-				c.Errors <- fmt.Errorf("error acknowledging after success for %q stream and %q message: %w", msg.Stream, msg.ID, err)
-				continue
-			}
-		case <-c.stopWorkers:
-			return
-		case <-c.options.Context.Done():
+		msg, ok := c.take()
+		if !ok {
 			return
 		}
+		if msg == nil {
+			continue
+		}
+		err := c.process(msg)
+		if err != nil {
+			c.Errors <- fmt.Errorf("error calling ConsumerFunc for %q stream and %q message: %w", msg.Stream, msg.ID, err)
+			continue
+		}
+		err = c.ackMessage(context.Background(), msg.Stream, msg.ID)
+		if err != nil {
+			c.Errors <- fmt.Errorf("error acknowledging after success for %q stream and %q message: %w", msg.Stream, msg.ID, err)
+			continue
+		}
 	}
+}
+
+// take waits for the next message for a worker to process. Every
+// ReclaimShare-th take prefers a reclaim candidate and the rest prefer the
+// queue; if the preferred source has nothing ready, take waits for whichever
+// has a message first. A reclaim candidate is claimed before it is returned,
+// and the message is nil if it could no longer be claimed. take returns false
+// when the worker should stop.
+func (c *Consumer) take() (*Message, bool) {
+	first, second := c.queue, c.reclaimQueue
+	if c.takes.Add(1)%int64(c.options.ReclaimShare) == 0 {
+		first, second = second, first
+	}
+
+	var msg *Message
+	from := first
+	select {
+	case msg = <-first:
+	case <-c.stopWorkers:
+		return nil, false
+	case <-c.options.Context.Done():
+		return nil, false
+	default:
+		select {
+		case msg = <-first:
+		case msg = <-second:
+			from = second
+		case <-c.stopWorkers:
+			return nil, false
+		case <-c.options.Context.Done():
+			return nil, false
+		}
+	}
+
+	if from == c.queue {
+		select {
+		case c.dequeued <- struct{}{}:
+		default:
+		}
+		return msg, true
+	}
+
+	messages, err := c.claimPendingMessage(msg.Stream, msg.ID)
+	if err != nil || len(messages) == 0 {
+		return nil, true
+	}
+	// XCLAIM was requested for exactly one ID.
+	m := messages[0]
+	return &Message{ID: m.ID, Stream: msg.Stream, Values: m.Values}, true
 }
 
 func (c *Consumer) process(msg *Message) (err error) {

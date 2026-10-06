@@ -3,6 +3,7 @@ package redisqueue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -74,7 +75,7 @@ func TestNewConsumerWithOptions(t *testing.T) {
 		assert.NotNil(tt, c)
 	})
 
-	t.Run("sets defaults for Name, GroupName, BlockingTimeout, and ReclaimTimeout", func(tt *testing.T) {
+	t.Run("sets defaults for Name, GroupName, BlockingTimeout, ReclaimTimeout, and ReclaimShare", func(tt *testing.T) {
 		c, err := NewConsumerWithOptions(&ConsumerOptions{})
 		require.NoError(tt, err)
 
@@ -85,9 +86,10 @@ func TestNewConsumerWithOptions(t *testing.T) {
 		assert.Equal(tt, "redisqueue", c.options.GroupName)
 		assert.Equal(tt, 5*time.Second, c.options.BlockingTimeout)
 		assert.Equal(tt, 1*time.Second, c.options.ReclaimInterval)
+		assert.Equal(tt, 4, c.options.ReclaimShare)
 	})
 
-	t.Run("allows override of Name, GroupName, BlockingTimeout, ReclaimTimeout, and RedisClient", func(tt *testing.T) {
+	t.Run("allows override of Name, GroupName, BlockingTimeout, ReclaimTimeout, ReclaimShare, and RedisClient", func(tt *testing.T) {
 		rc := newRedisClient(nil)
 
 		c, err := NewConsumerWithOptions(&ConsumerOptions{
@@ -95,6 +97,7 @@ func TestNewConsumerWithOptions(t *testing.T) {
 			GroupName:       "test_group_name",
 			BlockingTimeout: 10 * time.Second,
 			ReclaimInterval: 10 * time.Second,
+			ReclaimShare:    2,
 			RedisClient:     rc,
 		})
 		require.NoError(tt, err)
@@ -104,6 +107,7 @@ func TestNewConsumerWithOptions(t *testing.T) {
 		assert.Equal(tt, "test_group_name", c.options.GroupName)
 		assert.Equal(tt, 10*time.Second, c.options.BlockingTimeout)
 		assert.Equal(tt, 10*time.Second, c.options.ReclaimInterval)
+		assert.Equal(tt, 2, c.options.ReclaimShare)
 	})
 
 	t.Run("bubbles up errors", func(tt *testing.T) {
@@ -215,7 +219,7 @@ func TestWorkerRetriesAckTimeouts(t *testing.T) {
 	}
 }
 
-func TestReclaimStreamUsesIdleFilter(t *testing.T) {
+func TestReclaimBatchUsesIdleFilter(t *testing.T) {
 	xpendingArgs := make(chan []interface{}, 1)
 	rc := newRedisClient(nil)
 	rc.AddHook(commandHook{process: func(cmd redis.Cmder) {
@@ -238,7 +242,7 @@ func TestReclaimStreamUsesIdleFilter(t *testing.T) {
 	require.NoError(t, c.redis.XGroupCreateMkStream(context.TODO(), stream, c.options.GroupName, "$").Err())
 	c.Register(stream, func(msg *Message) error { return nil })
 
-	c.reclaimStream(stream)
+	c.reclaimBatch(stream, "-", "+")
 
 	require.Equal(t, []interface{}{
 		"xpending",
@@ -252,19 +256,22 @@ func TestReclaimStreamUsesIdleFilter(t *testing.T) {
 	}, <-xpendingArgs)
 }
 
-func TestReclaimStreamFallsBackWhenIdleFilterUnsupported(t *testing.T) {
+func TestReclaimFallsBackWhenIdleFilterUnsupported(t *testing.T) {
 	const staleID = "1-0"
 	const freshID = "2-0"
 
 	stream := t.Name()
 	xpendingArgs := make([][]interface{}, 0)
-	xclaimArgs := make([][]interface{}, 0)
 	xpendingWithoutIdleCalls := 0
 
 	rc := newRedisClient(nil)
 	rc.AddHook(commandHook{intercept: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
 		switch strings.ToLower(cmd.Name()) {
 		case "xpending":
+			if summary, ok := cmd.(*redis.XPendingCmd); ok {
+				summary.SetVal(&redis.XPending{Count: 2, Lower: staleID, Higher: freshID})
+				return nil
+			}
 			args := append([]interface{}{}, cmd.Args()...)
 			xpendingArgs = append(xpendingArgs, args)
 
@@ -280,15 +287,6 @@ func TestReclaimStreamFallsBackWhenIdleFilterUnsupported(t *testing.T) {
 				})
 			}
 			return nil
-		case "xclaim":
-			args := append([]interface{}{}, cmd.Args()...)
-			xclaimArgs = append(xclaimArgs, args)
-			id := args[len(args)-1].(string)
-			cmd.(*redis.XMessageSliceCmd).SetVal([]redis.XMessage{{
-				ID:     id,
-				Values: map[string]interface{}{"test": "value"},
-			}})
-			return nil
 		default:
 			return next(ctx, cmd)
 		}
@@ -302,57 +300,385 @@ func TestReclaimStreamFallsBackWhenIdleFilterUnsupported(t *testing.T) {
 		RedisClient:       rc,
 	})
 	require.NoError(t, err)
+	c.Register(stream, func(msg *Message) error { return nil })
+	candidates := collectReclaimCandidates(t, c)
 
-	c.reclaimStream(stream)
+	c.reclaimPendingMessages()
 
 	require.Len(t, xpendingArgs, 3)
 	assert.True(t, hasStringArg(xpendingArgs[0], "idle"))
 	assert.False(t, hasStringArg(xpendingArgs[1], "idle"))
 	assert.False(t, hasStringArg(xpendingArgs[2], "idle"))
-	require.Len(t, xclaimArgs, 1)
-	assert.Equal(t, staleID, xclaimArgs[0][len(xclaimArgs[0])-1])
+
+	assert.Equal(t, staleID, nextReclaimCandidate(t, candidates).ID)
 
 	select {
-	case msg := <-c.queue:
-		assert.Equal(t, staleID, msg.ID)
-	case <-time.After(time.Second):
-		t.Fatal("expected reclaimed stale message")
-	}
-
-	select {
-	case msg := <-c.queue:
+	case msg := <-candidates:
 		t.Fatalf("expected fresh message to stay pending, got %q", msg.ID)
-	default:
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
-func TestReclaimStreamSkipsWhenQueueFull(t *testing.T) {
-	xpendingArgs := make(chan []interface{}, 1)
-	rc := newRedisClient(nil)
-	rc.AddHook(commandHook{process: func(cmd redis.Cmder) {
-		if strings.EqualFold(cmd.Name(), "xpending") {
-			xpendingArgs <- append([]interface{}{}, cmd.Args()...)
+// collectReclaimCandidates stands in for the workers, receiving the candidates
+// reclaim hands off without claiming them.
+func collectReclaimCandidates(t *testing.T, c *Consumer) <-chan *Message {
+	t.Helper()
+	candidates := make(chan *Message, 100)
+	go func() {
+		for {
+			select {
+			case m := <-c.reclaimQueue:
+				candidates <- m
+			case <-c.options.Context.Done():
+				return
+			}
 		}
-	}})
+	}()
+	t.Cleanup(c.options.contextCancel)
+	return candidates
+}
 
+func nextReclaimCandidate(t *testing.T, candidates <-chan *Message) *Message {
+	t.Helper()
+	select {
+	case m := <-candidates:
+		return m
+	case <-time.After(time.Second):
+		t.Fatal("expected a reclaim candidate")
+		return nil
+	}
+}
+
+// addStalePending adds n messages to stream and delivers them to a consumer
+// that never acknowledges them, returning their IDs.
+func addStalePending(t *testing.T, rc redis.UniversalClient, stream, group string, n int) []string {
+	t.Helper()
+	ctx := context.TODO()
+	rc.Del(ctx, stream)
+	require.NoError(t, rc.XGroupCreateMkStream(ctx, stream, group, "$").Err())
+
+	ids := make([]string, n)
+	for i := range ids {
+		id, err := rc.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream,
+			Values: map[string]interface{}{"i": i},
+		}).Result()
+		require.NoError(t, err)
+		ids[i] = id
+	}
+	require.NoError(t, rc.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: "dead_consumer",
+		Streams:  []string{stream, ">"},
+		Count:    int64(n),
+	}).Err())
+	return ids
+}
+
+// Model a stream whose pending tail grows on every scan. Failed messages
+// stay pending, so each new pass must return to the oldest ID.
+func TestReclaimBoundsPassWhilePendingTailGrows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tail, scans, snapshots := 1, 0, 0
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{intercept: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		switch cmd.Name() {
+		case "ping":
+			cmd.(*redis.StatusCmd).SetVal("PONG")
+		case "xpending":
+			if summary, ok := cmd.(*redis.XPendingCmd); ok {
+				snapshots++
+				summary.SetVal(&redis.XPending{Count: int64(tail), Lower: "1-0", Higher: fmt.Sprintf("%d-0", tail)})
+				return nil
+			}
+			scans++
+			if scans > 8 {
+				cancel() // Keep the regression finite on the unbounded implementation.
+				return context.Canceled
+			}
+			tail++
+			args := cmd.Args()
+			start, end := 1, tail
+			if args[5] != "-" {
+				var sequence int
+				_, err := fmt.Sscanf(args[5].(string), "%d-%d", &start, &sequence)
+				require.NoError(t, err)
+				if sequence > 0 {
+					start++
+				}
+			}
+			if args[6] != "+" {
+				_, err := fmt.Sscanf(args[6].(string), "%d-0", &end)
+				require.NoError(t, err)
+			}
+			var pending []redis.XPendingExt
+			if start <= end {
+				pending = append(pending, redis.XPendingExt{ID: fmt.Sprintf("%d-0", start), Idle: time.Hour})
+			}
+			cmd.(*redis.XPendingExtCmd).SetVal(pending)
+		default:
+			return next(ctx, cmd)
+		}
+		return nil
+	}})
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Context: ctx, RedisClient: rc, BufferSize: 20, VisibilityTimeout: time.Minute,
+	})
+	require.NoError(t, err)
+	defer c.options.contextCancel()
+	c.Errors = make(chan error, 10)
+	c.Register(t.Name(), func(*Message) error { return errors.New("processing failed") })
+	candidates := collectReclaimCandidates(t, c)
+
+	c.reclaimPendingMessages()
+	require.NoError(t, ctx.Err(), "the pass followed the growing pending tail")
+	first := nextReclaimCandidate(t, candidates)
+	require.Equal(t, "1-0", first.ID)
+	require.Empty(t, candidates)
+	require.Error(t, c.process(first)) // The failed message is never acknowledged.
+
+	c.reclaimPendingMessages()
+	require.NoError(t, ctx.Err())
+	require.Equal(t, 2, snapshots)
+	require.Equal(t, first.ID, nextReclaimCandidate(t, candidates).ID, "the next pass must retry the oldest failure")
+}
+
+func TestReclaimDrainsBacklogWhenQueueIsEmpty(t *testing.T) {
 	c, err := NewConsumerWithOptions(&ConsumerOptions{
 		Name:              "test_consumer",
 		GroupName:         "test_group",
-		VisibilityTimeout: time.Minute,
+		VisibilityTimeout: 50 * time.Millisecond,
 		BufferSize:        1,
-		RedisClient:       rc,
+		Concurrency:       1,
+	})
+	require.NoError(t, err)
+	c.Errors = make(chan error, 10)
+	defer c.options.contextCancel()
+
+	stream := t.Name()
+	ids := addStalePending(t, c.redis, stream, c.options.GroupName, 5)
+	time.Sleep(100 * time.Millisecond)
+
+	processed := make(chan string, len(ids))
+	c.Register(stream, func(msg *Message) error {
+		processed <- msg.ID
+		return nil
+	})
+	c.wg.Add(1)
+	go c.work()
+
+	c.reclaimPendingMessages()
+
+	for _, id := range ids {
+		select {
+		case got := <-processed:
+			assert.Equal(t, id, got)
+		case <-time.After(time.Second):
+			t.Fatalf("expected reclaimed message %q", id)
+		}
+	}
+}
+
+func TestReclaimTakesTurnsAcrossStreams(t *testing.T) {
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Name:              "test_consumer",
+		GroupName:         "test_group",
+		VisibilityTimeout: 50 * time.Millisecond,
+		BufferSize:        1,
+		Concurrency:       1,
+	})
+	require.NoError(t, err)
+	c.Errors = make(chan error, 10)
+	defer c.options.contextCancel()
+
+	streams := []string{t.Name() + ":a", t.Name() + ":b", t.Name() + ":c"}
+	ids := make(map[string][]string, len(streams))
+	processed := make(chan string, 6)
+	for _, stream := range streams {
+		ids[stream] = addStalePending(t, c.redis, stream, c.options.GroupName, 2)
+		c.Register(stream, func(msg *Message) error {
+			processed <- msg.Stream + "/" + msg.ID
+			return nil
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	var want []string
+	for i := 0; i < 2; i++ {
+		for _, stream := range streams {
+			want = append(want, stream+"/"+ids[stream][i])
+		}
+	}
+
+	c.wg.Add(1)
+	go c.work()
+
+	c.reclaimPendingMessages()
+
+	got := make([]string, 0, len(want))
+	for range want {
+		select {
+		case msg := <-processed:
+			got = append(got, msg)
+		case <-time.After(time.Second):
+			t.Fatalf("expected %d reclaimed messages, got %v", len(want), got)
+		}
+	}
+	assert.Equal(t, want, got)
+}
+
+// With new and reclaimed messages both always ready, workers take one reclaimed
+// message for every ReclaimShare messages, whatever the buffer size.
+func TestWorkersGiveReclaimedMessagesTheirShare(t *testing.T) {
+	for name, bufferSize := range map[string]int{"buffered": 4, "unbuffered": 0} {
+		t.Run(name, func(t *testing.T) {
+			rc := newRedisClient(nil)
+			rc.AddHook(commandHook{intercept: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+				if cmd.Name() != "xclaim" {
+					return next(ctx, cmd)
+				}
+				args := cmd.Args()
+				cmd.(*redis.XMessageSliceCmd).SetVal([]redis.XMessage{{ID: args[len(args)-1].(string)}})
+				return nil
+			}})
+			c, err := NewConsumerWithOptions(&ConsumerOptions{
+				Name:              "test_consumer",
+				GroupName:         "test_group",
+				VisibilityTimeout: time.Minute,
+				BufferSize:        bufferSize,
+				Concurrency:       1,
+				ReclaimShare:      3,
+				RedisClient:       rc,
+			})
+			require.NoError(t, err)
+			c.Errors = make(chan error, 100)
+
+			stream := t.Name()
+			processed := make(chan string, 100)
+			c.Register(stream, func(msg *Message) error {
+				processed <- msg.ID
+				// Give both feeders time to offer their next message.
+				time.Sleep(10 * time.Millisecond)
+				return nil
+			})
+			feed := func(ch chan *Message, id string) {
+				for {
+					select {
+					case ch <- &Message{ID: id, Stream: stream}:
+					case <-c.options.Context.Done():
+						return
+					}
+				}
+			}
+			go feed(c.queue, "new")
+			go feed(c.reclaimQueue, "reclaimed")
+			time.Sleep(20 * time.Millisecond)
+
+			c.wg.Add(1)
+			go c.work()
+			t.Cleanup(func() { c.options.contextCancel(); c.wg.Wait() })
+
+			want := []string{"new", "new", "reclaimed", "new", "new", "reclaimed", "new", "new", "reclaimed"}
+			got := make([]string, 0, len(want))
+			for range want {
+				select {
+				case id := <-processed:
+					got = append(got, id)
+				case <-time.After(time.Second):
+					t.Fatalf("expected %d messages, got %v", len(want), got)
+				}
+			}
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+func TestReclaimReachesWorkersWhileNewMessagesKeepQueueFull(t *testing.T) {
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Name:              "test_consumer",
+		GroupName:         "test_group",
+		VisibilityTimeout: 50 * time.Millisecond,
+		BufferSize:        1,
+		Concurrency:       1,
+	})
+	require.NoError(t, err)
+	c.Errors = make(chan error, 100)
+	defer c.options.contextCancel()
+
+	stream := t.Name()
+	stale := addStalePending(t, c.redis, stream, c.options.GroupName, 3)
+	time.Sleep(100 * time.Millisecond)
+
+	processed := make(chan string, len(stale))
+	isStale := make(map[string]bool, len(stale))
+	for _, id := range stale {
+		isStale[id] = true
+	}
+	c.Register(stream, func(msg *Message) error {
+		if isStale[msg.ID] {
+			processed <- msg.ID
+		}
+		return nil
+	})
+
+	// Stand in for poll with an endless supply of new messages.
+	go func() {
+		for i := 1; ; i++ {
+			select {
+			case c.queue <- &Message{ID: fmt.Sprintf("0-%d", i), Stream: stream}:
+			case <-c.options.Context.Done():
+				return
+			}
+		}
+	}()
+	require.Eventually(t, func() bool { return len(c.queue) == 1 }, time.Second, time.Millisecond)
+
+	c.wg.Add(1)
+	go c.work()
+	go c.reclaimPendingMessages()
+
+	for _, id := range stale {
+		select {
+		case got := <-processed:
+			assert.Equal(t, id, got)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected reclaimed message %q to reach a worker", id)
+		}
+	}
+}
+
+func TestReclaimStopsWhenConsumerShutsDown(t *testing.T) {
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Name:              "test_consumer",
+		GroupName:         "test_group",
+		VisibilityTimeout: 50 * time.Millisecond,
+		BufferSize:        1,
 	})
 	require.NoError(t, err)
 
-	c.Register(t.Name(), func(msg *Message) error { return nil })
-	c.queue <- &Message{ID: "queued"}
+	stream := t.Name()
+	addStalePending(t, c.redis, stream, c.options.GroupName, 1)
+	time.Sleep(100 * time.Millisecond)
+	c.Register(stream, func(msg *Message) error { return nil })
 
-	c.reclaimStream(t.Name())
+	done := make(chan struct{})
+	go func() {
+		c.reclaimPendingMessages()
+		close(done)
+	}()
 
 	select {
-	case args := <-xpendingArgs:
-		t.Fatalf("expected no XPENDING calls with a full queue, got %v", args)
-	default:
+	case <-done:
+		t.Fatal("expected reclaim to wait while no worker is free")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	c.options.contextCancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected reclaim to stop after shutdown")
 	}
 }
 
@@ -504,7 +830,192 @@ func TestPollReadsOneAtATimeForUnbufferedQueue(t *testing.T) {
 	}
 }
 
-func TestReclaimStreamErrorsIncludeContext(t *testing.T) {
+func TestReclaimWaitsForWorkerBeforeClaiming(t *testing.T) {
+	t.Run("buffered", func(t *testing.T) { testReclaimWaitsForWorkerBeforeClaiming(t, 1) })
+	t.Run("unbuffered", func(t *testing.T) { testReclaimWaitsForWorkerBeforeClaiming(t, 0) })
+}
+
+func testReclaimWaitsForWorkerBeforeClaiming(t *testing.T, bufferSize int) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listed := make(chan struct{}, 4)
+	claimed := make(chan string, 4)
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{process: func(cmd redis.Cmder) {
+		switch cmd.Name() {
+		case "xpending":
+			if _, ok := cmd.(*redis.XPendingExtCmd); ok {
+				listed <- struct{}{}
+			}
+		case "xclaim":
+			args := cmd.Args()
+			claimed <- args[len(args)-1].(string)
+		}
+	}})
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		Context: ctx, RedisClient: rc, BufferSize: bufferSize, Concurrency: 1,
+		Name: "test_consumer", GroupName: "test_group", VisibilityTimeout: 50 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	c.Errors = make(chan error, 10)
+	stream := t.Name()
+	ids := addStalePending(t, rc, stream, c.options.GroupName, 2)
+	time.Sleep(100 * time.Millisecond)
+
+	started := make(chan string, 3)
+	releaseBusy := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	c.RegisterContext(stream, func(ctx context.Context, msg *Message) error {
+		started <- msg.ID
+		var release <-chan struct{}
+		switch msg.ID {
+		case "busy":
+			release = releaseBusy
+		case ids[0]:
+			release = releaseFirst
+		default:
+			return nil
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	c.wg.Add(1)
+	go c.work()
+	t.Cleanup(func() { c.options.contextCancel(); c.wg.Wait() })
+	c.queue <- &Message{ID: "busy", Stream: stream}
+	require.Equal(t, "busy", <-started)
+	done := make(chan struct{})
+	go func() { c.reclaimPendingMessages(); close(done) }()
+
+	waitListed := func() {
+		t.Helper()
+		select {
+		case <-listed:
+		case <-time.After(time.Second):
+			t.Fatal("pending batch was not listed")
+		}
+	}
+	assertNotClaimed := func() {
+		t.Helper()
+		select {
+		case id := <-claimed:
+			t.Fatalf("claimed %q while the only worker was busy", id)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	waitStarted := func(want string) {
+		t.Helper()
+		select {
+		case id := <-started:
+			require.Equal(t, want, id)
+		case <-time.After(time.Second):
+			t.Fatal("worker did not start reclaimed message")
+		}
+	}
+	waitListed()
+	assertNotClaimed()
+	close(releaseBusy)
+	waitStarted(ids[0])
+	require.Equal(t, ids[0], <-claimed)
+	waitListed()
+	assertNotClaimed()
+	close(releaseFirst)
+	waitStarted(ids[1])
+	require.Equal(t, ids[1], <-claimed)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reclaim pass did not finish")
+	}
+}
+
+func TestReclaimRechecksIdleAfterWaitingForWorker(t *testing.T) {
+	listed, attempted := make(chan struct{}, 1), make(chan struct{}, 1)
+	rc := newRedisClient(nil)
+	rc.AddHook(commandHook{intercept: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		err := next(ctx, cmd)
+		switch cmd.Name() {
+		case "xpending":
+			if _, ok := cmd.(*redis.XPendingExtCmd); ok {
+				listed <- struct{}{}
+			}
+		case "xclaim":
+			attempted <- struct{}{}
+		}
+		return err
+	}})
+	c, err := NewConsumerWithOptions(&ConsumerOptions{
+		RedisClient: rc, BufferSize: 0, Concurrency: 1, Name: "test_consumer",
+		GroupName: "test_group", VisibilityTimeout: time.Minute,
+	})
+	require.NoError(t, err)
+	c.Errors = make(chan error, 10)
+	other := newRedisClient(nil)
+	defer other.Close()
+	stream := t.Name()
+	ids := addStalePending(t, other, stream, c.options.GroupName, 1)
+	require.NoError(t, other.Do(context.Background(), "XCLAIM", stream, c.options.GroupName,
+		"dead_consumer", 0, ids[0], "IDLE", int64((2*time.Minute)/time.Millisecond)).Err())
+
+	started := make(chan string, 3)
+	release := make(chan struct{})
+	c.RegisterContext(stream, func(ctx context.Context, msg *Message) error {
+		started <- msg.ID
+		if msg.ID == "busy" {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+		return nil
+	})
+	c.wg.Add(1)
+	go c.work()
+	t.Cleanup(func() { c.options.contextCancel(); c.wg.Wait() })
+	c.queue <- &Message{ID: "busy", Stream: stream}
+	require.Equal(t, "busy", <-started)
+	done := make(chan struct{})
+	go func() { c.reclaimBatch(stream, "-", "+"); close(done) }()
+	select {
+	case <-listed:
+	case <-time.After(time.Second):
+		t.Fatal("pending batch was not listed")
+	}
+	// A different consumer claims the candidate while our worker remains busy.
+	require.NoError(t, other.XClaim(context.Background(), &redis.XClaimArgs{
+		Stream: stream, Group: c.options.GroupName, Consumer: "other_consumer", Messages: ids,
+	}).Err())
+	close(release)
+	select {
+	case <-attempted:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not attempt claim")
+	}
+	// A normal message proves the worker finished the unsuccessful claim and
+	// returned to receiving work without processing the now-fresh candidate.
+	select {
+	case c.queue <- &Message{ID: "sentinel", Stream: stream}:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not resume receiving work")
+	}
+	require.Equal(t, "sentinel", <-started)
+	pending, err := other.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+		Stream: stream, Group: c.options.GroupName, Start: "-", End: "+", Count: 1,
+	}).Result()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	require.Equal(t, "other_consumer", pending[0].Consumer)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reclaim batch did not finish")
+	}
+}
+
+func TestReclaimErrorsIncludeContext(t *testing.T) {
 	c, err := NewConsumerWithOptions(&ConsumerOptions{
 		Name:              "test_consumer",
 		GroupName:         "test_group",
@@ -520,7 +1031,7 @@ func TestReclaimStreamErrorsIncludeContext(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- <-c.Errors }()
 
-	c.reclaimStream(stream)
+	c.reclaimBatch(stream, "-", "+")
 
 	err = <-errCh
 	require.Error(t, err)
